@@ -1,5 +1,7 @@
 # Status do Projeto ampar.ai
 
+**🔗 Repositório GitHub:** https://github.com/Sudo-psc/ampar-ai
+
 ## ✅ Configuração Concluída
 
 ### 1. Estrutura do Monorepo
