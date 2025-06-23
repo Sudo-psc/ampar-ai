@@ -1,0 +1,11 @@
+# Python dependencies for auxiliary scripts
+termcolor
+python-dotenv
+requests
+boto3
+psycopg2-binary
+redis
+pyyaml
+click
+cryptography
+pycryptodome 

@@ -1,0 +1,263 @@
+version: '3.9'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ampar-postgres
+    environment:
+      POSTGRES_USER: ampar_user
+      POSTGRES_PASSWORD: ampar_secure_password
+      POSTGRES_DB: ampar_ai
+      POSTGRES_EXTENSIONS: pgvector
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ampar_user -d ampar_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ampar-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: ampar-redis
+    command: redis-server --requirepass ampar_redis_password --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ampar-network
+
+  # Supabase Local (Auth + Realtime + Storage)
+  supabase-db:
+    image: supabase/postgres:15.1.0.117
+    container_name: ampar-supabase-db
+    environment:
+      POSTGRES_PASSWORD: supabase_secure_password
+      POSTGRES_DB: supabase
+    ports:
+      - "5433:5432"
+    volumes:
+      - supabase_db_data:/var/lib/postgresql/data
+    networks:
+      - ampar-network
+
+  supabase-auth:
+    image: supabase/gotrue:v2.132.3
+    container_name: ampar-supabase-auth
+    depends_on:
+      - supabase-db
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: http://localhost:9999
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://postgres:supabase_secure_password@supabase-db:5432/supabase?search_path=auth
+      GOTRUE_SITE_URL: http://localhost:3000
+      GOTRUE_URI_ALLOW_LIST: http://localhost:3000
+      GOTRUE_JWT_SECRET: your-super-secret-jwt-token-with-at-least-32-characters-long
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_SMTP_HOST: smtp.sendgrid.net
+      GOTRUE_SMTP_PORT: 587
+      GOTRUE_SMTP_USER: apikey
+      GOTRUE_SMTP_PASS: ${SENDGRID_API_KEY}
+      GOTRUE_SMTP_ADMIN_EMAIL: noreply@ampar.ai
+      GOTRUE_MAILER_AUTOCONFIRM: false
+      GOTRUE_SMS_AUTOCONFIRM: false
+    ports:
+      - "9999:9999"
+    networks:
+      - ampar-network
+
+  supabase-realtime:
+    image: supabase/realtime:v2.25.50
+    container_name: ampar-supabase-realtime
+    depends_on:
+      - supabase-db
+    environment:
+      DB_HOST: supabase-db
+      DB_PORT: 5432
+      DB_NAME: supabase
+      DB_USER: postgres
+      DB_PASSWORD: supabase_secure_password
+      DB_SSL: "false"
+      PORT: 4000
+      JWT_SECRET: your-super-secret-jwt-token-with-at-least-32-characters-long
+      REPLICATION_MODE: RLS
+      REPLICATION_POLL_INTERVAL: 100
+      SECURE_CHANNELS: "true"
+      SLOT_NAME: supabase_realtime_rls
+      TEMPORARY_SLOT: "true"
+    ports:
+      - "4000:4000"
+    networks:
+      - ampar-network
+
+  supabase-storage:
+    image: supabase/storage-api:v0.43.11
+    container_name: ampar-supabase-storage
+    depends_on:
+      - supabase-db
+    environment:
+      ANON_KEY: your-anon-key
+      SERVICE_KEY: your-service-role-key
+      PROJECT_REF: local
+      POSTGREST_URL: http://supabase-postgrest:3000
+      PGRST_JWT_SECRET: your-super-secret-jwt-token-with-at-least-32-characters-long
+      DATABASE_URL: postgres://postgres:supabase_secure_password@supabase-db:5432/supabase
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      REGION: stub
+      GLOBAL_S3_BUCKET: stub
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+      IMGPROXY_URL: http://imgproxy:8080
+    volumes:
+      - supabase_storage_data:/var/lib/storage
+    ports:
+      - "5001:5000"
+    networks:
+      - ampar-network
+
+  # MinIO (S3-compatible storage for development)
+  minio:
+    image: minio/minio:latest
+    container_name: ampar-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ampar_minio_user
+      MINIO_ROOT_PASSWORD: ampar_minio_password
+      MINIO_DEFAULT_BUCKETS: ampar-documents,ampar-media,ampar-backups
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - ampar-network
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ampar-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - ampar-network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ampar-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ampar_grafana_password
+      GF_USERS_ALLOW_SIGN_UP: false
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./infrastructure/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - ampar-network
+
+  # Loki (for logs)
+  loki:
+    image: grafana/loki:latest
+    container_name: ampar-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./infrastructure/monitoring/loki-config.yaml:/etc/loki/local-config.yaml
+      - loki_data:/loki
+    networks:
+      - ampar-network
+
+  # Jaeger (for tracing)
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: ampar-jaeger
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: :9411
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"
+      - "14268:14268"
+      - "14250:14250"
+      - "9411:9411"
+    networks:
+      - ampar-network
+
+  # pgAdmin (PostgreSQL GUI)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: ampar-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@ampar.ai
+      PGADMIN_DEFAULT_PASSWORD: ampar_pgadmin_password
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - ampar-network
+
+  # RedisInsight (Redis GUI)
+  redisinsight:
+    image: redislabs/redisinsight:latest
+    container_name: ampar-redisinsight
+    ports:
+      - "8001:8001"
+    volumes:
+      - redisinsight_data:/db
+    networks:
+      - ampar-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  supabase_db_data:
+  supabase_storage_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  redisinsight_data:
+
+networks:
+  ampar-network:
+    driver: bridge 
